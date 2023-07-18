@@ -26,7 +26,8 @@ use crate::transport::mrp::ReliableMessage;
 use crate::transport::packet::PacketPool;
 use crate::transport::{exchange, packet::Packet, proto_demux, queue, session, udp};
 
-use super::proto_demux::ProtoCtx;
+use super::exchange::ExchangeCtx;
+use super::proto_demux::{ProtoCtx, SessionEvent};
 use super::queue::Msg;
 
 pub struct Mgr {
@@ -116,10 +117,11 @@ impl Mgr {
             match msg {
                 Msg::NewSession(clone_data) => {
                     // If a new session was created, add it
-                    let _ = self
+                    let session = self
                         .exch_mgr
                         .add_session(&clone_data)
-                        .map_err(|e| error!("Error adding new session {:?}", e));
+                        .map_err(|e| { error!("Error adding new session {:?}", e); e })?;
+                    self.proto_demux.notify_session_event(SessionEvent::Established(session.get_index()));
                 }
                 _ => {
                     error!("Queue Message Type not yet handled {:?}", msg);
@@ -129,8 +131,26 @@ impl Mgr {
         Ok(())
     }
 
-    pub fn start(&mut self) -> Result<(), Error> {
+    pub fn send_with_new_session<PacketBuilder>(&mut self, mut proto_tx: BoxSlab<PacketPool>, peer_addr: super::network::Address, peer_nodeid: Option<u64>, packet_builder: PacketBuilder) -> Result<(), Error> 
+        where PacketBuilder: FnOnce(&mut BoxSlab<PacketPool>, &mut ExchangeCtx) -> Result<(), Error>
+    {
+        let exch_id = {
+            let mut exch_ctx = self.exch_mgr.new_session(peer_addr, peer_nodeid)?;
+            packet_builder(&mut proto_tx, &mut exch_ctx)?;
+            exch_ctx.exch.get_id()
+        };
+        self.exch_mgr.send(exch_id, proto_tx)?;
+        Ok(())
+    }
+
+    pub fn start<InitiatorHandler: FnMut(&mut Self, BoxSlab<PacketPool>)> (&mut self, mut initiator_handler: InitiatorHandler) -> Result<(), Error> {
         loop {
+            {
+                if let Ok(tx) = Self::new_tx() {
+                    initiator_handler(self, tx);
+                }
+            }
+
             // Handle network operations
             if self.handle_rxtx().is_err() {
                 error!("Error in handle_rxtx");

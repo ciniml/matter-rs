@@ -57,10 +57,13 @@ impl proto_demux::HandleProto for SecureChannel {
         let result = match proto_opcode {
             OpCode::MRPStandAloneAck => Ok(ResponseRequired::No),
             OpCode::PBKDFParamRequest => self.pase.pbkdfparamreq_handler(ctx),
+            OpCode::PBKDFParamResponse => self.pase.pbkdfparamresp_handler(ctx),
             OpCode::PASEPake1 => self.pase.pasepake1_handler(ctx),
+            OpCode::PASEPake2 => self.pase.pasepake2_handler(ctx),
             OpCode::PASEPake3 => self.pase.pasepake3_handler(ctx),
             OpCode::CASESigma1 => self.case.casesigma1_handler(ctx),
             OpCode::CASESigma3 => self.case.casesigma3_handler(ctx),
+            OpCode::StatusReport => self.pase.statusreport_handler(ctx),
             _ => {
                 error!("OpCode Not Handled: {:?}", proto_opcode);
                 Err(Error::InvalidOpcode)
@@ -71,6 +74,16 @@ impl proto_demux::HandleProto for SecureChannel {
             tlv::print_tlv_list(ctx.tx.as_borrow_slice());
         }
         result
+    }
+
+    fn handle_session_event(&self, event: proto_demux::SessionEvent) -> Result<(), Error> {
+        match event {
+            proto_demux::SessionEvent::Established(session_index) => {
+                self.pase.set_session(Some(session_index));
+                Ok(())
+            },
+            _ => Ok(())
+        }
     }
 
     fn get_proto_id(&self) -> usize {

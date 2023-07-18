@@ -42,7 +42,17 @@ pub trait CryptoSpake2 {
     #[allow(non_snake_case)]
     fn set_L_from_w1s(&mut self, w1s: &[u8]) -> Result<(), Error>;
     #[allow(non_snake_case)]
+    fn get_pA(&mut self, pA: &mut [u8]) -> Result<(), Error>;
+    #[allow(non_snake_case)]
     fn get_pB(&mut self, pB: &mut [u8]) -> Result<(), Error>;
+    #[allow(non_snake_case)]
+    fn get_TT_as_prover(
+        &mut self,
+        context: &[u8],
+        pA: &[u8],
+        pB: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), Error>;
     #[allow(non_snake_case)]
     fn get_TT_as_verifier(
         &mut self,

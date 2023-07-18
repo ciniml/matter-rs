@@ -19,7 +19,7 @@ use log::error;
 
 use crate::error::Error;
 
-use super::CryptoKeyPair;
+use super::{CryptoKeyPair, CryptoRandom};
 
 pub struct KeyPairDummy {}
 
@@ -51,6 +51,20 @@ impl CryptoKeyPair for KeyPairDummy {
         Err(Error::Invalid)
     }
     fn verify_msg(&self, _msg: &[u8], _signature: &[u8]) -> Result<(), Error> {
+        error!("This API should never get called");
+        Err(Error::Invalid)
+    }
+}
+
+pub struct CryptoRandomDummy {}
+impl CryptoRandomDummy {
+    pub fn new() -> Result<Self, Error> {
+        Ok(Self {})
+    }
+}
+
+impl CryptoRandom for CryptoRandomDummy {
+    fn fill_random(&self, dest: &mut [u8]) -> Result<(), Error> {
         error!("This API should never get called");
         Err(Error::Invalid)
     }

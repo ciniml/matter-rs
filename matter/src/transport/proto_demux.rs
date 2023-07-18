@@ -21,6 +21,7 @@ use crate::error::*;
 
 use super::exchange::ExchangeCtx;
 use super::packet::PacketPool;
+use super::session::{SessionHandle, SessionMgr};
 
 const MAX_PROTOCOLS: usize = 4;
 
@@ -53,12 +54,30 @@ impl<'a> ProtoCtx<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum SessionEvent {
+    Established(usize),
+}
+
+impl SessionEvent {
+    pub fn get_session_index(&self) -> Option<usize> {
+        match self {
+            SessionEvent::Established(session_handle) => Some(*session_handle),
+            _ => None,
+        }
+    }
+    pub fn get_session_handle<'a>(&self, session_mgr: &'a mut SessionMgr) -> Option<SessionHandle<'a>> {
+        self.get_session_index()
+            .map(move |session_index| session_mgr.get_session_handle(session_index))
+    }
+}
+
 pub trait HandleProto {
     fn handle_proto_id(&mut self, proto_ctx: &mut ProtoCtx) -> Result<ResponseRequired, Error>;
 
     fn get_proto_id(&self) -> usize;
 
-    fn handle_session_event(&self) -> Result<(), Error> {
+    fn handle_session_event(&self, _event: SessionEvent) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -91,5 +110,17 @@ impl ProtoDemux {
             .as_mut()
             .ok_or(Error::NoHandler)?
             .handle_proto_id(proto_ctx);
+    }
+
+    pub fn notify_session_event(&mut self, event: SessionEvent) -> Result<(), Error> {
+        self.proto_id_handlers.as_mut()
+            .iter_mut()
+            .try_for_each(|handler| {
+                if let Some(handler) = handler {
+                    handler.handle_session_event(event.clone())
+                } else {
+                    Ok(())
+                }
+            })
     }
 }

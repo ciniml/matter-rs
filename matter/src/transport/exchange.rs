@@ -17,7 +17,7 @@
 
 use boxslab::{BoxSlab, Slab};
 use colored::*;
-use log::{error, info, trace};
+use log::{error, info, trace, debug};
 use std::any::Any;
 use std::fmt;
 use std::time::SystemTime;
@@ -27,6 +27,7 @@ use crate::secure_channel;
 
 use heapless::LinearMap;
 
+use super::network::Address;
 use super::packet::PacketPool;
 use super::session::CloneData;
 use super::{mrp::ReliableMessage, packet::Packet, session::SessionHandle, session::SessionMgr};
@@ -235,6 +236,7 @@ const MAX_EXCHANGES: usize = 8;
 #[derive(Default)]
 pub struct ExchangeMgr {
     // keys: exch-id
+    next_exch_id: u16,
     exchanges: LinearMap<u16, Exchange, MAX_EXCHANGES>,
     sess_mgr: SessionMgr,
 }
@@ -244,6 +246,7 @@ pub const MAX_MRP_ENTRIES: usize = 4;
 impl ExchangeMgr {
     pub fn new(sess_mgr: SessionMgr) -> Self {
         Self {
+            next_exch_id: rand::random::<u16>(),    // Do we need to use cryptographycally secure random?
             sess_mgr,
             exchanges: Default::default(),
         }
@@ -264,6 +267,12 @@ impl ExchangeMgr {
         ExchangeMgr::_get_with_id(&mut self.exchanges, exch_id)
     }
 
+    fn next_id(&mut self) -> u16 {
+        let id = self.next_exch_id;
+        self.next_exch_id = self.next_exch_id.wrapping_add(1);
+        id
+    }
+
     fn _get(
         exchanges: &mut LinearMap<u16, Exchange, MAX_EXCHANGES>,
         sess_idx: usize,
@@ -276,7 +285,7 @@ impl ExchangeMgr {
             if create_new {
                 // If an exchange doesn't exist, create a new one
                 info!("Creating new exchange");
-                let e = Exchange::new(id, sess_idx, role);
+                let e: Exchange = Exchange::new(id, sess_idx, role);
                 if exchanges.insert(id, e).is_err() {
                     return Err(Error::NoSpace);
                 }
@@ -291,6 +300,7 @@ impl ExchangeMgr {
             if result.get_role() == role && sess_idx == result.sess_idx {
                 Ok(result)
             } else {
+                info!("Exchange {:x}: Role or session index mismatch, expected=({:?},{:?}), actual=({:?},{:?})", id, role, sess_idx, result.get_role(), result.sess_idx);
                 Err(Error::NoExchange)
             }
         } else {
@@ -351,6 +361,20 @@ impl ExchangeMgr {
             ExchangeMgr::_get_with_id(&mut self.exchanges, exch_id).ok_or(Error::NoExchange)?;
         let mut session = self.sess_mgr.get_session_handle(exchange.sess_idx);
         exchange.send(proto_tx, &mut session)
+    }
+
+    pub fn new_session(&mut self, peer_addr: Address, peer_nodeid: Option<u64>) -> Result<ExchangeCtx, Error> {
+        let sess_idx = self.sess_mgr.add(peer_addr, peer_nodeid)?;
+        let id = self.next_id();
+        info!("New session {:x} and exchange {:x} created", sess_idx, id);
+        let exchange =
+            ExchangeMgr::_get(&mut self.exchanges, sess_idx, id, Role::Initiator, true)?;
+        let session = self.sess_mgr.get_session_handle(sess_idx);
+        let exch_ctx = ExchangeCtx {
+            exch: exchange,
+            sess: session,
+        };
+        Ok(exch_ctx)
     }
 
     pub fn purge(&mut self) {

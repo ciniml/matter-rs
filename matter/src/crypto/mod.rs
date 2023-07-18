@@ -45,6 +45,11 @@ pub trait CryptoKeyPair {
     fn verify_msg(&self, msg: &[u8], signature: &[u8]) -> Result<(), Error>;
 }
 
+// Cryptographically secure random number generator
+pub trait CryptoRandom {
+    fn fill_random(&self, dest: &mut [u8]) -> Result<(), Error>;
+}
+
 #[cfg(feature = "crypto_esp_mbedtls")]
 mod crypto_esp_mbedtls;
 #[cfg(feature = "crypto_esp_mbedtls")]

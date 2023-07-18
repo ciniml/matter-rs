@@ -61,10 +61,20 @@ pub enum Spake2VerifierState {
     Confirmed,
 }
 
+#[derive(PartialEq, Copy, Clone, Debug)]
+pub enum Spake2ProverState {
+    // Initialised - w0, L are set
+    Init,
+    // Pending Confirmation - Keys are derived but pending confirmation
+    PendingConfirmation,
+    // Confirmed
+    Confirmed,
+}
+
 #[derive(PartialEq, Debug)]
 pub enum Spake2Mode {
     Unknown,
-    Prover,
+    Prover(Spake2ProverState),
     Verifier(Spake2VerifierState),
 }
 
@@ -74,6 +84,7 @@ pub struct Spake2P {
     context: Option<Sha256>,
     Ke: [u8; 16],
     cA: [u8; 32],
+    pA: [u8; 65],
     crypto_spake2: Option<Box<dyn CryptoSpake2>>,
     app_data: u32,
 }
@@ -165,6 +176,7 @@ impl Spake2P {
             crypto_spake2: None,
             Ke: [0; 16],
             cA: [0; 32],
+            pA: [0; 65],
             app_data: 0,
         }
     }
@@ -177,13 +189,40 @@ impl Spake2P {
         self.app_data
     }
 
+    pub fn get_Ke(&self, ke: &mut [u8]) {
+        ke.copy_from_slice(&self.Ke);
+    }
+
+    /**
+     * Calculate context for Crypto_Transcript
+     */
     pub fn set_context(&mut self, buf1: &[u8], buf2: &[u8]) -> Result<(), Error> {
+        self.initialize_context()?;
+        self.update_context(buf1)?;
+        self.update_context(buf2)?;
+        Ok(())
+    }
+
+    /**
+     * Initialize context for Crypto_Transcript
+     */
+    pub fn initialize_context(&mut self) -> Result<(), Error> {
         let mut context = Sha256::new()?;
         context.update(&SPAKE2P_CONTEXT_PREFIX)?;
-        context.update(buf1)?;
-        context.update(buf2)?;
         self.context = Some(context);
         Ok(())
+    }
+
+    /**
+     * Update context for Crypto_Transcript
+     */
+    pub fn update_context(&mut self, buf: &[u8]) -> Result<(), Error> {
+        if let Some(context) = &mut self.context {
+            context.update(buf)?;
+            Ok(())
+        } else {
+            Err(Error::Invalid)
+        }
     }
 
     #[inline(always)]
@@ -191,6 +230,22 @@ impl Spake2P {
         let mut pw_str: [u8; 4] = [0; 4];
         LittleEndian::write_u32(&mut pw_str, pw);
         let _ = pbkdf2_hmac(&pw_str, iter as usize, salt, w0w1s);
+    }
+
+    #[allow(non_snake_case)]
+    pub fn start_prover(&mut self, passcode: u32, iteration_count: u32, salt: &[u8], pA: &mut [u8]) -> Result<(), Error> {
+        let mut crypto_spake2 = crypto_spake2_new()?;
+        let mut w0w1s = [0; 2 * CRYPTO_W_SIZE_BYTES];
+        Spake2P::get_w0w1s(passcode, iteration_count, salt, &mut w0w1s);
+        
+        let w0s_len = w0w1s.len() / 2;
+        crypto_spake2.set_w0_from_w0s(&w0w1s[0..w0s_len])?;
+        crypto_spake2.set_L_from_w1s(&w0w1s[w0s_len..])?;
+        crypto_spake2.get_pA(pA)?;
+        self.pA.copy_from_slice(pA);
+        self.crypto_spake2 = Some(crypto_spake2);
+        self.mode = Spake2Mode::Prover(Spake2ProverState::Init);
+        Ok(())
     }
 
     pub fn start_verifier(&mut self, verifier: &VerifierData) -> Result<(), Error> {
@@ -243,6 +298,28 @@ impl Spake2P {
         // We are finished with using the crypto_spake2 now
         self.crypto_spake2 = None;
         self.mode = Spake2Mode::Verifier(Spake2VerifierState::PendingConfirmation);
+        Ok(())
+    }
+    
+    #[allow(non_snake_case)]
+    pub fn handle_pB(&mut self, pB: &[u8], cA: &mut [u8], cB: &mut [u8]) -> Result<(), Error> {
+        if self.mode != Spake2Mode::Prover(Spake2ProverState::Init) {
+            return Err(Error::InvalidState);
+        }
+
+        if let Some(crypto_spake2) = &mut self.crypto_spake2 {
+            if let Some(context) = self.context.take() {
+                let mut hash = [0u8; crypto::SHA256_HASH_LEN_BYTES];
+                context.finish(&mut hash)?;
+                let mut TT = [0u8; crypto::SHA256_HASH_LEN_BYTES];
+                crypto_spake2.get_TT_as_prover(&hash, &self.pA, pB, &mut TT)?;
+                Spake2P::get_Ke_and_cAcB(&TT, &self.pA, pB, &mut self.Ke, cA, cB)?;
+            }
+        }
+
+        // We are finished with using the crypto_spake2 now
+        self.crypto_spake2 = None;
+        self.mode = Spake2Mode::Prover(Spake2ProverState::PendingConfirmation);
         Ok(())
     }
 

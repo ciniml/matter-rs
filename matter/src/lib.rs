@@ -86,4 +86,6 @@ pub mod tlv;
 pub mod transport;
 pub mod utils;
 
+pub mod controller;
+
 pub use crate::core::*;

@@ -105,6 +105,6 @@ impl Matter {
     /// This call starts the Matter daemon that starts communication with other Matter
     /// devices on the network.
     pub fn start_daemon(&mut self) -> Result<(), Error> {
-        self.transport_mgr.start()
+        self.transport_mgr.start(|_, _| { })
     }
 }

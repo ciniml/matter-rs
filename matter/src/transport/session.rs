@@ -205,6 +205,10 @@ impl Session {
             SessionMode::PlainText => false,
         }
     }
+    
+    pub fn get_local_node_id(&self) -> u64 {
+        self.local_nodeid
+    }
 
     pub fn get_peer_node_id(&self) -> Option<u64> {
         self.peer_nodeid
@@ -281,6 +285,8 @@ impl Session {
         if self.mode == SessionMode::PlainText {
             if let Some(d) = self.peer_nodeid {
                 proto_tx.plain.set_dest_u64(d);
+            } else {
+                proto_tx.plain.set_src_u64(0); // Set local node ID to 0 if this is unsecured session.
             }
         }
         let mut tmp_buf: [u8; plain_hdr::max_plain_hdr_len()] = [0; plain_hdr::max_plain_hdr_len()];
@@ -440,8 +446,16 @@ impl SessionMgr {
                 {
                     nodeid_matches = false;
                 }
+                info!("expected sessid: {}, peer_addr: {}, is_encrypted: {}, actual sessid: {}, peer_addr: {}, is_encrypted: {}, nodeid_matches: {}", sess_id, peer_addr, is_encrypted, x.local_sess_id, x.peer_addr, x.is_encrypted(), nodeid_matches);
+                let expected_peer_ip_addr = match peer_addr {
+                    Address::Udp(addr) => addr.ip(),
+                };
+                let actual_peer_ip_addr = match x.peer_addr {
+                    Address::Udp(addr) => addr.ip(),
+                };
+
                 x.local_sess_id == sess_id
-                    && x.peer_addr == peer_addr
+                    && expected_peer_ip_addr == actual_peer_ip_addr
                     && x.is_encrypted() == is_encrypted
                     && nodeid_matches
             } else {
@@ -574,6 +588,10 @@ impl<'a> SessionHandle<'a> {
 
     pub fn send(&mut self, proto_tx: BoxSlab<PacketPool>) -> Result<(), Error> {
         self.sess_mgr.send(self.sess_idx, proto_tx)
+    }
+
+    pub fn get_index(&self) -> usize {
+        self.sess_idx
     }
 }
 

@@ -22,13 +22,13 @@ use std::{
 
 use super::{
     common::{create_sc_status_report, SCStatusCodes},
-    spake2p::{Spake2P, VerifierData},
+    spake2p::{Spake2P, VerifierData}, status_report::{StatusReportView, parse_status_report},
 };
 use crate::{
-    crypto,
+    crypto::{self, Random, CryptoRandom},
     error::Error,
     mdns::{self, Mdns},
-    secure_channel::common::OpCode,
+    secure_channel::{common::{OpCode, PROTO_ID_SECURE_CHANNEL}, status_report::{ProtocolCode, GeneralCode}},
     sys::SysMdnsService,
     tlv::{self, get_root_node_struct, FromTLV, OctetStr, TLVElement, TLVWriter, TagType, ToTLV},
     transport::{
@@ -36,19 +36,22 @@ use crate::{
         network::Address,
         proto_demux::{ProtoCtx, ResponseRequired},
         queue::{Msg, WorkQ},
-        session::{CloneData, SessionMode},
-    },
+        session::{CloneData, SessionMode}, packet::PacketPool,
+    }, interaction_model::messages::ib::Status,
 };
+use boxslab::BoxSlab;
 use log::{error, info};
 use rand::prelude::*;
 
 enum PaseMgrState {
     Enabled(PAKE, SysMdnsService),
     Disabled,
+    Commissioner(PAKE),
 }
 
 pub struct PaseMgrInternal {
     state: PaseMgrState,
+    session: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -59,6 +62,7 @@ impl PaseMgr {
     pub fn new() -> Self {
         Self(Arc::new(Mutex::new(PaseMgrInternal {
             state: PaseMgrState::Disabled,
+            session: None,
         })))
     }
 
@@ -96,9 +100,43 @@ impl PaseMgr {
         }
     }
 
+    fn if_commissioner<F>(&mut self, ctx: &mut ProtoCtx, f: F) -> Result<(), Error>
+    where
+        F: FnOnce(&mut PAKE, &mut ProtoCtx) -> Result<(), Error>,
+    {
+        let mut s = self.0.lock().unwrap();
+        if let PaseMgrState::Commissioner(pake) = &mut s.state {
+            f(pake, ctx)
+        } else {
+            error!("PASE is not in commissioner mode");
+            create_sc_status_report(&mut ctx.tx, SCStatusCodes::InvalidParameter, None)
+        }
+    }
+
+    pub fn start_commissioning(
+        &mut self,
+        passcode: u32,
+        tx: &mut BoxSlab<PacketPool>,
+        exch_ctx: &mut ExchangeCtx,
+    ) -> Result<(), Error> {
+        let mut s = self.0.lock().unwrap();
+        let mut pake = PAKE::new_commissioner(passcode);
+        tx.set_proto_opcode(OpCode::PBKDFParamRequest as u8);
+        pake.start_commissioning(tx, exch_ctx)?;
+        s.state = PaseMgrState::Commissioner(pake);
+        Ok(())
+    }
+
     pub fn pbkdfparamreq_handler(&mut self, ctx: &mut ProtoCtx) -> Result<ResponseRequired, Error> {
         ctx.tx.set_proto_opcode(OpCode::PBKDFParamResponse as u8);
         self.if_enabled(ctx, |pake, ctx| pake.handle_pbkdfparamrequest(ctx))?;
+        Ok(ResponseRequired::Yes)
+    }
+
+    pub fn pbkdfparamresp_handler(&mut self, ctx: &mut ProtoCtx) -> Result<ResponseRequired, Error> {
+        ctx.tx.set_proto_opcode(OpCode::PASEPake1 as u8);
+        ctx.tx.plain.set_src_u64(0);
+        self.if_commissioner(ctx, |pake, ctx| pake.handle_pbkdfparamresponse(ctx))?;
         Ok(ResponseRequired::Yes)
     }
 
@@ -108,10 +146,31 @@ impl PaseMgr {
         Ok(ResponseRequired::Yes)
     }
 
+    pub fn pasepake2_handler(&mut self, ctx: &mut ProtoCtx) -> Result<ResponseRequired, Error> {
+        ctx.tx.set_proto_opcode(OpCode::PASEPake3 as u8);
+        self.if_commissioner(ctx, |pake, ctx| pake.handle_pasepake2(ctx))?;
+        Ok(ResponseRequired::Yes)
+    }
+
     pub fn pasepake3_handler(&mut self, ctx: &mut ProtoCtx) -> Result<ResponseRequired, Error> {
         self.if_enabled(ctx, |pake, ctx| pake.handle_pasepake3(ctx))?;
         self.disable_pase_session();
         Ok(ResponseRequired::Yes)
+    }
+
+    pub fn statusreport_handler(&mut self, ctx: &mut ProtoCtx) -> Result<ResponseRequired, Error> {
+        self.if_commissioner(ctx, |pake, ctx| pake.handle_statusreport(ctx))?;
+        Ok(ResponseRequired::No)
+    }
+
+    pub fn set_session(&self, session: Option<usize>) {
+        let mut s = self.0.lock().unwrap();
+        s.session = session;
+    }
+
+    pub fn with_session<R, F: FnOnce(Option<usize>) -> R>(&self, op: F) -> R {
+        let s = self.0.lock().unwrap();
+        op(s.session)
     }
 }
 
@@ -196,7 +255,8 @@ impl Default for PakeState {
 }
 
 pub struct PAKE {
-    pub verifier: VerifierData,
+    pub passcode: Option<u32>,
+    pub verifier: Option<VerifierData>,
     state: PakeState,
 }
 
@@ -204,9 +264,54 @@ impl PAKE {
     pub fn new(verifier: VerifierData) -> Self {
         // TODO: Can any PBKDF2 calculation be pre-computed here
         PAKE {
-            verifier,
+            passcode: None,
+            verifier: Some(verifier),
             state: Default::default(),
         }
+    }
+    pub fn new_commissioner(passcode: u32) -> Self {
+        // TODO: Can any PBKDF2 calculation be pre-computed here
+        PAKE {
+            passcode: Some(passcode),
+            verifier: None,
+            state: Default::default(),
+        }
+    }
+
+    pub fn start_commissioning(&mut self, tx: &mut BoxSlab<PacketPool>, exch_ctx: &mut ExchangeCtx) -> Result<(), Error> {
+        if !self.state.is_idle() {
+            let sd = self.state.take()?;
+            if sd.is_sess_expired()? {
+                info!("Previous session expired, clearing it");
+                self.state = PakeState::Idle;
+            } else {
+                info!("Previous session in-progress, denying new request");
+                // little-endian timeout (here we've hardcoded 500ms)
+                create_sc_status_report(tx, SCStatusCodes::Busy, Some(&[0xf4, 0x01]))?;
+                return Ok(());
+            }
+        }
+
+        let mut tw = TLVWriter::new(tx.get_writebuf()?);
+        let random = Random::new();
+        let mut initiator_random = [0u8; 32];
+        random.fill_random(&mut initiator_random)?;
+        let sess_id = exch_ctx.sess.reserve_new_sess_id();
+        let req = PBKDFParamReq {
+            initiator_random: OctetStr::new(&initiator_random),
+            passcode_id: 0,
+            initiator_ssid: sess_id,
+            has_params: false,
+        };
+        req.to_tlv(&mut tw, TagType::Anonymous)?;
+
+        let mut spake2p = Box::new(Spake2P::new());
+        spake2p.initialize_context()?;
+        spake2p.update_context(tx.as_borrow_slice())?;
+
+        self.state.make_in_progress(spake2p, exch_ctx);
+
+        Ok(())
     }
 
     #[allow(non_snake_case)]
@@ -257,7 +362,7 @@ impl PAKE {
         let pA = extract_pasepake_1_or_3_params(ctx.rx.as_borrow_slice())?;
         let mut pB: [u8; 65] = [0; 65];
         let mut cB: [u8; 32] = [0; 32];
-        sd.spake2p.start_verifier(&self.verifier)?;
+        sd.spake2p.start_verifier(&self.verifier.as_ref().expect("verifier must be specified"))?;
         sd.spake2p.handle_pA(pA, &mut pB, &mut cB)?;
 
         let mut tw = TLVWriter::new(ctx.tx.get_writebuf()?);
@@ -287,7 +392,7 @@ impl PAKE {
         }
 
         let root = tlv::get_root_node(ctx.rx.as_borrow_slice())?;
-        let a = PBKDFParamReq::from_tlv(&root)?;
+        let a: PBKDFParamReq<'_> = PBKDFParamReq::from_tlv(&root)?;
         if a.passcode_id != 0 {
             error!("Can't yet handle passcode_id != 0");
             return Err(Error::Invalid);
@@ -310,9 +415,10 @@ impl PAKE {
             params: None,
         };
         if !a.has_params {
+            let verifier: &VerifierData = self.verifier.as_ref().expect("verifier must be specified");
             let params_resp = PBKDFParamRespParams {
-                count: self.verifier.count,
-                salt: OctetStr(&self.verifier.salt),
+                count: verifier.count,
+                salt: OctetStr(&verifier.salt),
             };
             resp.params = Some(params_resp);
         }
@@ -323,10 +429,122 @@ impl PAKE {
 
         Ok(())
     }
+    
+    /**
+     * Handles PBKDFParamResponse message.
+     * The sequence is described in the Matter core specification 1.0 p.154
+     */
+    pub fn handle_pbkdfparamresponse(&mut self, ctx: &mut ProtoCtx) -> Result<(), Error> {
+        let mut sd = self.state.take_sess_data(&ctx.exch_ctx)?;
+
+        let root = tlv::get_root_node(ctx.rx.as_borrow_slice())?;
+        let pbkdf_param_resp = PBKDFParamResp::from_tlv(&root)?;
+        let pbkdf_params = pbkdf_param_resp.params.ok_or(Error::InvalidData)?;
+        
+        let mut pa = [0u8; 65];
+        sd.spake2p.start_prover(self.passcode.expect("Passcode must be specified")
+            , pbkdf_params.count
+            , &pbkdf_params.salt.0
+            , &mut pa)?;
+        let req = Pake1Req {
+            pa: OctetStr(&pa),
+        };
+
+        let local_sessid = ctx.exch_ctx.sess.get_local_sess_id();
+        let spake2p_data: u32 = ((local_sessid as u32) << 16) | pbkdf_param_resp.local_sessid as u32;
+        let mut spake2p = Box::new(Spake2P::new());
+        spake2p.set_app_data(spake2p_data);
+        
+        let mut tw = TLVWriter::new(ctx.tx.get_writebuf()?);
+        req.to_tlv(&mut tw, TagType::Anonymous)?;
+        sd.spake2p.update_context(ctx.rx.as_borrow_slice())?;
+
+        self.state.set_sess_data(sd);
+        Ok(())
+    }
+
+    
+    /**
+     * Handles Pake2 message from responder
+     * The sequence is described in the Matter core specification 1.0 p.154
+     */
+    pub fn handle_pasepake2(&mut self, ctx: &mut ProtoCtx) -> Result<(), Error> {
+        let mut sd = self.state.take_sess_data(&ctx.exch_ctx)?;
+
+        let root = tlv::get_root_node(ctx.rx.as_borrow_slice())?;
+        let pake2 = Pake1Resp::from_tlv(&root)?;
+        
+        let mut ca = [0u8; 32];
+        let mut cb = [0u8; 32];
+        sd.spake2p.handle_pB(pake2.pb.0, &mut ca, &mut cb)?;
+
+        if pake2.cb.0 != cb {
+            log::warn!("cb mismatch expected: {:?} actual: {:?}", cb, pake2.cb.0);
+            create_sc_status_report(&mut ctx.tx, SCStatusCodes::InvalidParameter, Some(&[0xf4, 0x01]))?;
+            return Ok(())
+        }
+
+        let req = Pake3 {
+            ca: OctetStr(&ca),
+        };
+        
+        let mut tw = TLVWriter::new(ctx.tx.get_writebuf()?);
+        req.to_tlv(&mut tw, TagType::Anonymous)?;
+
+        self.state.set_sess_data(sd);
+        Ok(())
+    }
+
+    /**
+     * Handles Pake2 message from responder
+     * The sequence is described in the Matter core specification 1.0 p.154
+     */
+    pub fn handle_statusreport(&mut self, ctx: &mut ProtoCtx) -> Result<(), Error> {
+        let mut sd = self.state.take_sess_data(&ctx.exch_ctx)?;
+
+        let status_report = parse_status_report(ctx.rx.as_borrow_slice())?;
+        info!("PAKE Status Report: {:?}", status_report);
+        if status_report.general_code != GeneralCode::Success || status_report.proto_id != (PROTO_ID_SECURE_CHANNEL as u32) || status_report.proto_code != ProtocolCode::SessionEstablishmentSuccess {
+            return Ok(());       
+        }
+
+        // Get the keys
+        let mut ke = [0; 16];
+        sd.spake2p.get_Ke(&mut ke);
+
+        let mut session_keys = [0; 48];
+        crypto::hkdf_sha256(&[], &ke, &SPAKE2_SESSION_KEYS_INFO, &mut session_keys)
+            .map_err(|_x| Error::NoSpace)?;
+
+        // Create a session
+        let data = sd.spake2p.get_app_data();
+        let peer_sessid: u16 = (data & 0xffff) as u16;
+        let local_sessid: u16 = ((data >> 16) & 0xffff) as u16;
+        let mut clone_data = CloneData::new(
+            0,
+            0,
+            peer_sessid,
+            local_sessid,
+            ctx.exch_ctx.sess.get_peer_addr(),
+            SessionMode::Pase,
+        );
+        clone_data.dec_key.copy_from_slice(&session_keys[0..16]);
+        clone_data.enc_key.copy_from_slice(&session_keys[16..32]);
+        clone_data
+            .att_challenge
+            .copy_from_slice(&session_keys[32..48]);
+
+        // Queue a transport mgr request to add a new session
+        WorkQ::get()?.sync_send(Msg::NewSession(clone_data))?;
+        
+        ctx.exch_ctx.exch.close();
+
+        Ok(())
+    }
 }
 
-#[derive(ToTLV)]
-#[tlvargs(start = 1)]
+#[derive(FromTLV, ToTLV)]
+#[tlvargs(lifetime = "'a", start = 1)]
 struct Pake1Resp<'a> {
     pb: OctetStr<'a>,
     cb: OctetStr<'a>,
@@ -334,13 +552,25 @@ struct Pake1Resp<'a> {
 
 #[derive(ToTLV)]
 #[tlvargs(start = 1)]
+struct Pake1Req<'a> {
+    pa: OctetStr<'a>,
+}
+
+#[derive(FromTLV, ToTLV)]
+#[tlvargs(lifetime = "'a", start = 1)]
+struct Pake3<'a> {
+    ca: OctetStr<'a>,
+}
+
+#[derive(FromTLV, ToTLV)]
+#[tlvargs(lifetime = "'a", start = 1)]
 struct PBKDFParamRespParams<'a> {
     count: u32,
     salt: OctetStr<'a>,
 }
 
-#[derive(ToTLV)]
-#[tlvargs(start = 1)]
+#[derive(FromTLV, ToTLV)]
+#[tlvargs(lifetime = "'a", start = 1)]
 struct PBKDFParamResp<'a> {
     init_random: OctetStr<'a>,
     our_random: OctetStr<'a>,
@@ -355,7 +585,7 @@ fn extract_pasepake_1_or_3_params(buf: &[u8]) -> Result<&[u8], Error> {
     Ok(pA)
 }
 
-#[derive(FromTLV)]
+#[derive(ToTLV, FromTLV)]
 #[tlvargs(lifetime = "'a", start = 1)]
 struct PBKDFParamReq<'a> {
     initiator_random: OctetStr<'a>,

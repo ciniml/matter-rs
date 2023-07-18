@@ -200,6 +200,24 @@ impl CryptoKeyPair for KeyPair {
     }
 }
 
+pub struct Random {
+    rng: CtrDrbg,
+}
+impl Random {
+    pub fn new() -> Self {
+        Self {
+            rng: CtrDrbg::new(Arc::new(OsEntropy::new()), None).unwrap(),
+        }
+    }
+}
+impl CryptoRandom for Random {
+    fn fill_random(&self, dest: &mut [u8]) -> Result<(), Error> {
+        // I don't know thread_rng is cryptographically secure or not.
+        self.rng.fill_bytes(dest);
+        Ok(())
+    }
+}
+
 fn convert_r_s_to_asn1_sign(signature: &[u8], mbedtls_sign: &mut [u8]) -> Result<usize, Error> {
     let r = &signature[0..32];
     let s = &signature[32..64];

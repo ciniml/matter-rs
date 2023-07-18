@@ -30,6 +30,7 @@ use p256::{
     ecdsa::{Signature, SigningKey, VerifyingKey},
     AffinePoint, EncodedPoint, PublicKey, SecretKey,
 };
+use rand::RngCore;
 use sha2::Digest;
 use x509_cert::{
     attr::AttributeType,
@@ -41,7 +42,7 @@ use x509_cert::{
 
 use crate::error::Error;
 
-use super::CryptoKeyPair;
+use super::{CryptoKeyPair, CryptoRandom};
 
 type HmacSha256I = hmac::Hmac<sha2::Sha256>;
 type AesCcm = Ccm<Aes128, U16, U13>;
@@ -276,6 +277,21 @@ impl CryptoKeyPair for KeyPair {
             .verify(msg, &signature)
             .map_err(|_| Error::InvalidSignature)?;
 
+        Ok(())
+    }
+}
+
+pub struct Random {}
+impl Random {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+impl CryptoRandom for Random {
+    fn fill_random(&self, dest: &mut [u8]) -> Result<(), Error> {
+        // I don't know thread_rng is cryptographically secure or not.
+        let mut rng = rand::thread_rng();
+        rng.fill_bytes(dest);
         Ok(())
     }
 }

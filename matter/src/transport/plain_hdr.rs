@@ -53,6 +53,11 @@ pub struct PlainHdr {
 }
 
 impl PlainHdr {
+    pub fn set_src_u64(&mut self, id: u64) {
+        self.flags |= MsgFlags::SRC_ADDR_PRESENT;
+        self.peer_nodeid = Some(id);
+    }
+
     pub fn set_dest_u64(&mut self, id: u64) {
         self.flags |= MsgFlags::DSIZ_UNICAST_NODEID;
         self.peer_nodeid = Some(id);
@@ -82,6 +87,9 @@ impl PlainHdr {
 
         if self.flags.contains(MsgFlags::SRC_ADDR_PRESENT) {
             self.peer_nodeid = Some(msg.le_u64()?);
+        }
+        if self.flags.contains(MsgFlags::DSIZ_UNICAST_NODEID) {
+            msg.le_u64()?;  // Just ignore destination node ID.
         }
 
         info!(

@@ -51,6 +51,7 @@ pub struct CryptoRustCrypto {
     M: p256::EncodedPoint,
     N: p256::EncodedPoint,
     L: p256::EncodedPoint,
+    pA: p256::EncodedPoint,
     pB: p256::EncodedPoint,
 }
 
@@ -60,6 +61,7 @@ impl CryptoSpake2 for CryptoRustCrypto {
         let M = p256::EncodedPoint::from_bytes(MATTER_M_BIN).unwrap();
         let N = p256::EncodedPoint::from_bytes(MATTER_N_BIN).unwrap();
         let L = p256::EncodedPoint::default();
+        let pA = p256::EncodedPoint::default();
         let pB = p256::EncodedPoint::default();
 
         Ok(CryptoRustCrypto {
@@ -69,6 +71,7 @@ impl CryptoSpake2 for CryptoRustCrypto {
             M,
             N,
             L,
+            pA,
             pB,
         })
     }
@@ -163,6 +166,26 @@ impl CryptoSpake2 for CryptoRustCrypto {
     }
 
     #[allow(non_snake_case)]
+    fn get_pA(&mut self, pA: &mut [u8]) -> Result<(), Error> {
+        // From the SPAKE2+ spec (https://datatracker.ietf.org/doc/draft-bar-cfrg-spake2plus/)
+        //   for x
+        //   - select random x between 0 to p
+        //   - X = x*P + w0*M
+        //   - pA = X
+        let mut rng = rand::thread_rng();
+        self.xy = p256::Scalar::random(&mut rng);
+
+        let P = p256::AffinePoint::GENERATOR;
+        let M = p256::AffinePoint::from_encoded_point(&self.M).unwrap();
+
+        self.pA = Self::do_add_mul(P, self.xy, M, self.w0)?;
+        let pA_internal = self.pA.as_bytes();
+        pA.copy_from_slice(pA_internal);
+
+        Ok(())
+    }
+
+    #[allow(non_snake_case)]
     fn get_pB(&mut self, pB: &mut [u8]) -> Result<(), Error> {
         // From the SPAKE2+ spec (https://datatracker.ietf.org/doc/draft-bar-cfrg-spake2plus/)
         //   for y
@@ -177,6 +200,47 @@ impl CryptoSpake2 for CryptoRustCrypto {
         self.pB = Self::do_add_mul(P, self.xy, N, self.w0)?;
         let pB_internal = self.pB.as_bytes();
         pB.copy_from_slice(pB_internal);
+
+        Ok(())
+    }
+
+    #[allow(non_snake_case)]
+    fn get_TT_as_prover(
+        &mut self,
+        context: &[u8],
+        pA: &[u8],
+        pB: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        let mut TT = sha2::Sha256::new();
+        // Context
+        Self::add_to_tt(&mut TT, context)?;
+        // 2 empty identifiers
+        Self::add_to_tt(&mut TT, &[])?;
+        Self::add_to_tt(&mut TT, &[])?;
+        // M
+        Self::add_to_tt(&mut TT, &MATTER_M_BIN)?;
+        // N
+        Self::add_to_tt(&mut TT, &MATTER_N_BIN)?;
+        // X = pA
+        Self::add_to_tt(&mut TT, pA)?;
+        // Y = pB
+        Self::add_to_tt(&mut TT, pB)?;
+
+        let Y = p256::EncodedPoint::from_bytes(pB).unwrap();
+        let Y = p256::AffinePoint::from_encoded_point(&Y).unwrap();
+        let N = p256::AffinePoint::from_encoded_point(&self.N).unwrap();
+        let (Z, V) = Self::get_ZV_as_prover(self.w0, self.w1, N, Y, self.xy)?;
+
+        // Z
+        Self::add_to_tt(&mut TT, Z.as_bytes())?;
+        // V
+        Self::add_to_tt(&mut TT, V.as_bytes())?;
+        // w0
+        Self::add_to_tt(&mut TT, self.w0.to_bytes().to_vec().as_ref())?;
+
+        let h = TT.finalize();
+        out.copy_from_slice(h.as_slice());
 
         Ok(())
     }
